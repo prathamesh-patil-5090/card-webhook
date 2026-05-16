@@ -66,7 +66,7 @@ function buildEventPassHtml(name: string): string {
               Hi <strong>${greeting}</strong>,
             </p>
             <p style="font-size:15px; color:#374151; line-height:1.65; margin:0;">
-              See you at Palghar's first exclusive creator event — <strong>31st May at 4PM</strong>.
+              See you at Palghar's first exclusive creator event — <strong>31st May</strong>.
             </p>
           </div>
           <div style="padding:16px 32px 24px; background:#f9fafb; border-top:1px solid #e8eaf0;">
