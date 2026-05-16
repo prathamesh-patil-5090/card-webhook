@@ -29,6 +29,25 @@ function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getField(fields: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (key in fields) return fields[key];
+  }
+  return null;
+}
+
+function getObjectField(
+  fields: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> | null {
+  const value = getField(fields, keys);
+  return isRecord(value) ? value : null;
+}
+
 function getStringField(
   fields: Record<string, unknown>,
   keys: string[],
@@ -44,26 +63,60 @@ function getStringField(
   return null;
 }
 
-function getField(fields: Record<string, unknown>, keys: string[]): unknown {
+function getStringFieldLoose(
+  fields: Record<string, unknown>,
+  keys: string[],
+): string | null {
   for (const key of keys) {
-    if (key in fields) {
-      return fields[key];
+    const value = fields[key];
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === "string") {
+          const trimmed = item.trim();
+          if (trimmed) return trimmed;
+        }
+      }
     }
   }
 
   return null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function splitWordPressUserAgent(userAgent: string | null): string | null {
+  if (!userAgent) return null;
+
+  const match = userAgent.match(/WordPress\/[^;]+;\s*(https?:\/\/[^\s]+)/i);
+  return match?.[1] ?? null;
 }
 
-function getObjectField(
-  fields: Record<string, unknown>,
-  keys: string[],
-): Record<string, unknown> | null {
-  const value = getField(fields, keys);
-  return isRecord(value) ? value : null;
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/$/, "");
+}
+
+function getWordPressMediaBaseUrl(request: NextRequest): string | null {
+  const headers = Object.fromEntries(request.headers.entries());
+  const explicit = getStringFieldLoose(headers, [
+    "x-wordpress-site-url",
+    "x-site-url",
+    "x-origin",
+    "origin",
+    "referer",
+  ]);
+
+  if (explicit) {
+    try {
+      return normalizeBaseUrl(new URL(explicit).origin);
+    } catch {
+      // Ignore and fall through to user agent parsing.
+    }
+  }
+
+  return splitWordPressUserAgent(request.headers.get("user-agent"));
 }
 
 function isProbablyUrl(value: string): boolean {
@@ -113,8 +166,99 @@ async function fetchImageFromUrl(
   return { buffer, mimeType };
 }
 
+async function fetchWordPressMediaByGuess(
+  baseUrl: string,
+  guesses: string[],
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  const uniqueGuesses = [
+    ...new Set(guesses.map((guess) => guess.trim()).filter(Boolean)),
+  ];
+
+  for (const guess of uniqueGuesses) {
+    const queryUrl = new URL(
+      `${normalizeBaseUrl(baseUrl)}/wp-json/wp/v2/media`,
+    );
+    queryUrl.searchParams.set("search", guess);
+    queryUrl.searchParams.set("per_page", "100");
+
+    const response = await fetch(queryUrl);
+    if (!response.ok) continue;
+
+    const items = (await response.json()) as Array<Record<string, unknown>>;
+    const item = items.find((candidate) => {
+      const sourceUrl =
+        typeof candidate.source_url === "string" ? candidate.source_url : "";
+      const slug = typeof candidate.slug === "string" ? candidate.slug : "";
+      const title =
+        isRecord(candidate.title) &&
+        typeof candidate.title.rendered === "string"
+          ? candidate.title.rendered
+          : "";
+
+      return (
+        sourceUrl.includes(guess) ||
+        slug === guess ||
+        title.toLowerCase().includes(guess.toLowerCase())
+      );
+    });
+
+    const sourceUrl =
+      item && typeof item.source_url === "string" ? item.source_url : null;
+    if (!sourceUrl) continue;
+
+    try {
+      return await fetchImageFromUrl(sourceUrl);
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function collectBracketNamespace(
+  fields: Record<string, unknown>,
+  namespace: string,
+): Record<string, unknown> | null {
+  const prefix = `${namespace}[`;
+  const result: Record<string, unknown> = {};
+  let found = false;
+
+  for (const [key, value] of Object.entries(fields)) {
+    if (!key.startsWith(prefix)) continue;
+
+    const tokens = [...key.matchAll(/\[([^\]]+)\]/g)].map((match) => match[1]);
+    if (tokens.length === 0) continue;
+
+    found = true;
+    let cursor: Record<string, unknown> = result;
+
+    tokens.forEach((token, index) => {
+      const isLast = index === tokens.length - 1;
+
+      if (isLast) {
+        cursor[token] = value;
+        return;
+      }
+
+      const existing = cursor[token];
+      if (isRecord(existing)) {
+        cursor = existing;
+        return;
+      }
+
+      const next: Record<string, unknown> = {};
+      cursor[token] = next;
+      cursor = next;
+    });
+  }
+
+  return found ? result : null;
+}
+
 async function resolveImageSource(
   fields: Record<string, unknown>,
+  request: NextRequest,
 ): Promise<{ buffer: Buffer; mimeType: string }> {
   const image = getField(fields, [
     "image",
@@ -130,6 +274,7 @@ async function resolveImageSource(
     "avatar",
     "file",
   ]);
+
   const imageObject = getObjectField(fields, [
     "image",
     "imageData",
@@ -140,6 +285,9 @@ async function resolveImageSource(
     "featuredImage",
     "featured_image",
   ]);
+
+  const wpImageMeta = collectBracketNamespace(fields, "image");
+
   const mimeTypeHint = getStringField(fields, [
     "imageMimeType",
     "image_mime_type",
@@ -152,14 +300,13 @@ async function resolveImageSource(
     "image_content_type",
   ]);
 
+  const wordpressBaseUrl = getWordPressMediaBaseUrl(request);
+
   const tryResolveString = async (
     value: string,
   ): Promise<{ buffer: Buffer; mimeType: string } | null> => {
     const trimmed = value.trim();
-
-    if (!trimmed) {
-      return null;
-    }
+    if (!trimmed) return null;
 
     if (trimmed.startsWith("data:")) {
       const decoded = decodeDataUrl(trimmed);
@@ -212,30 +359,41 @@ async function resolveImageSource(
     if (resolved) return resolved;
   }
 
-  if (imageObject) {
-    const objectCandidates: Array<unknown> = [
-      imageObject.url,
-      imageObject.src,
-      imageObject.source_url,
-      imageObject.data,
-      imageObject.base64,
-      imageObject.content,
-      imageObject.image,
-      imageObject.file,
-    ];
+  const candidateObjects = [imageObject, wpImageMeta].filter(isRecord) as Array<
+    Record<string, unknown>
+  >;
 
-    const objectMimeType = getStringField(imageObject, [
+  for (const object of candidateObjects) {
+    const objectMimeType = getStringField(object, [
       "mimeType",
       "mime_type",
+      "mime",
       "contentType",
       "content_type",
       "type",
     ]);
 
+    const objectCandidates: Array<unknown> = [
+      object.url,
+      object.src,
+      object.source_url,
+      object.data,
+      object.base64,
+      object.content,
+      object.image,
+      object.file,
+      object.name,
+      object.filename,
+      object.fileName,
+      object.postname,
+      object.slug,
+    ];
+
     for (const candidate of objectCandidates) {
       if (candidate instanceof File && candidate.size > 0) {
         const mimeType =
           candidate.type || objectMimeType || mimeTypeHint || "image/jpeg";
+
         if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
           throw new Error(
             "Unsupported image type. Use JPEG, PNG, WebP, or GIF.",
@@ -253,10 +411,22 @@ async function resolveImageSource(
         if (resolved) return resolved;
       }
     }
+
+    if (wordpressBaseUrl) {
+      const guessed = await fetchWordPressMediaByGuess(
+        wordpressBaseUrl,
+        [
+          getStringFieldLoose(object, ["name", "filename", "fileName"]),
+          getStringFieldLoose(object, ["postname", "post_name", "slug"]),
+        ].filter(Boolean) as string[],
+      );
+
+      if (guessed) return guessed;
+    }
   }
 
   throw new Error(
-    "Field 'image' must be a file, a data URL, an image URL, or an object containing one of those values.",
+    "Field 'image' must be a file, a data URL, an image URL, or WordPress media metadata that can be resolved to a public URL.",
   );
 }
 
@@ -266,8 +436,7 @@ async function readRequestFields(
   const contentType = request.headers.get("content-type") || "";
 
   if (contentType.includes("application/json")) {
-    const body = (await request.json()) as Record<string, unknown>;
-    return body;
+    return (await request.json()) as Record<string, unknown>;
   }
 
   if (
@@ -293,13 +462,15 @@ export async function OPTIONS() {
 export async function POST(request: NextRequest) {
   try {
     const fields = await readRequestFields(request);
-    const name = getStringField(fields, ["name", "fullName"]);
-    const email = getStringField(fields, ["email"]);
 
     console.info("[generate-card] Incoming fields", {
       keys: Object.keys(fields),
       contentType: request.headers.get("content-type"),
+      userAgent: request.headers.get("user-agent"),
     });
+
+    const name = getStringField(fields, ["name", "fullName"]);
+    const email = getStringField(fields, ["email"]);
 
     if (!name) {
       return jsonWithCors({ error: "Field 'name' is required." }, 400);
@@ -312,7 +483,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { buffer: imageBuffer, mimeType } = await resolveImageSource(fields);
+    const { buffer: imageBuffer, mimeType } = await resolveImageSource(
+      fields,
+      request,
+    );
 
     const html = await buildCardHtml(name, imageBuffer, mimeType);
     const pngBuffer = await captureCardPng(html);
