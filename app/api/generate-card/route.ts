@@ -63,28 +63,101 @@ function getStringField(
   return null;
 }
 
+function coerceFormString(value: unknown): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (value instanceof File && value.name) {
+    return value.name.trim() || null;
+  }
+
+  return null;
+}
+
 function getStringFieldLoose(
   fields: Record<string, unknown>,
   keys: string[],
 ): string | null {
   for (const key of keys) {
     const value = fields[key];
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      if (trimmed) return trimmed;
-    }
+    const coerced = coerceFormString(value);
+    if (coerced) return coerced;
 
     if (Array.isArray(value)) {
       for (const item of value) {
-        if (typeof item === "string") {
-          const trimmed = item.trim();
-          if (trimmed) return trimmed;
-        }
+        const itemValue = coerceFormString(item);
+        if (itemValue) return itemValue;
       }
     }
   }
 
   return null;
+}
+
+function normalizeUploadReference(value: string): string {
+  const trimmed = value.trim().replace(/\\/g, "/");
+  const withoutFakepath = trimmed.replace(/^.*[/\\]/, "");
+  return withoutFakepath || trimmed;
+}
+
+function wpSanitizeTitle(value: string): string {
+  const withoutExtension = value.replace(/\.[^./\\]+$/, "");
+
+  return withoutExtension
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function buildWordPressImageGuesses(
+  meta: Record<string, unknown>,
+): string[] {
+  const name = getStringFieldLoose(meta, [
+    "name",
+    "filename",
+    "fileName",
+    "file",
+    "title",
+  ]);
+  const postname = getStringFieldLoose(meta, [
+    "postname",
+    "post_name",
+    "slug",
+    "postName",
+  ]);
+  const id = getStringFieldLoose(meta, ["id", "ID", "attachment_id", "attachmentId"]);
+
+  const guesses = new Set<string>();
+
+  for (const raw of [name, postname, id]) {
+    if (!raw) continue;
+
+    const normalized = normalizeUploadReference(raw);
+    guesses.add(raw);
+    guesses.add(normalized);
+
+    const basename = normalized.split("/").pop();
+    if (basename) guesses.add(basename);
+
+    const slug = wpSanitizeTitle(normalized);
+    if (slug) guesses.add(slug);
+
+    const basenameSlug = basename ? wpSanitizeTitle(basename) : "";
+    if (basenameSlug) guesses.add(basenameSlug);
+
+    if (normalized.includes("/")) {
+      guesses.add(normalized.replace(/^\/+/, ""));
+    }
+  }
+
+  return [...guesses].filter(Boolean);
 }
 
 function splitWordPressUserAgent(userAgent: string | null): string | null {
@@ -325,12 +398,102 @@ async function fetchWordPressMediaByGuess(
   return null;
 }
 
+async function fetchWordPressLatestMediaByMime(
+  baseUrl: string,
+  mimeType: string,
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  const queryUrl = new URL(`${normalizeBaseUrl(baseUrl)}/wp-json/wp/v2/media`);
+  queryUrl.searchParams.set("per_page", "1");
+  queryUrl.searchParams.set("orderby", "date");
+  queryUrl.searchParams.set("order", "desc");
+  queryUrl.searchParams.set("mime_type", mimeType);
+
+  const response = await fetch(queryUrl);
+  if (!response.ok) return null;
+
+  const items = (await response.json()) as Array<Record<string, unknown>>;
+  const sourceUrl = items[0] ? getWordPressMediaSourceUrl(items[0]) : null;
+  if (!sourceUrl) return null;
+
+  try {
+    return await fetchImageFromUrl(sourceUrl);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchWordPressMediaFromRecent(
+  baseUrl: string,
+  guesses: string[],
+  mimeType: string | null,
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  const queryUrl = new URL(`${normalizeBaseUrl(baseUrl)}/wp-json/wp/v2/media`);
+  queryUrl.searchParams.set("per_page", "100");
+  queryUrl.searchParams.set("orderby", "date");
+  queryUrl.searchParams.set("order", "desc");
+  if (mimeType) {
+    queryUrl.searchParams.set("mime_type", mimeType);
+  }
+
+  const response = await fetch(queryUrl);
+  if (!response.ok) return null;
+
+  const items = (await response.json()) as Array<Record<string, unknown>>;
+  const uniqueGuesses = [...new Set(guesses.map((guess) => guess.trim()).filter(Boolean))];
+
+  for (const guess of uniqueGuesses) {
+    const item = items.find((candidate) => mediaItemMatchesGuess(candidate, guess));
+    const sourceUrl = item ? getWordPressMediaSourceUrl(item) : null;
+    if (!sourceUrl) continue;
+
+    try {
+      return await fetchImageFromUrl(sourceUrl);
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+async function tryDirectWordPressUploads(
+  baseUrl: string,
+  references: string[],
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  for (const reference of references) {
+    const normalized = normalizeUploadReference(reference).replace(/^\/+/, "");
+    if (!normalized || isProbablyUrl(normalized)) continue;
+
+    try {
+      const direct = await fetchImageFromUrl(
+        buildWordPressUploadsUrl(baseUrl, normalized),
+      );
+      if (ALLOWED_IMAGE_TYPES.has(direct.mimeType)) {
+        return direct;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
 async function resolveWordPressBracketImage(
   meta: Record<string, unknown>,
   baseUrl: string,
 ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  const mimeType = getStringFieldLoose(meta, [
+    "mimeType",
+    "mime_type",
+    "mime",
+    "contentType",
+    "content_type",
+    "type",
+  ]);
+
   const id = getStringFieldLoose(meta, ["id", "ID", "attachment_id", "attachmentId"]);
-  if (id) {
+  if (id && /^\d+$/.test(id)) {
     const byId = await fetchWordPressMediaById(baseUrl, id);
     if (byId) return byId;
   }
@@ -341,22 +504,9 @@ async function resolveWordPressBracketImage(
     "slug",
     "postName",
   ]);
-  if (postname) {
-    const bySlug = await fetchWordPressMediaBySlug(baseUrl, postname);
-    if (bySlug) return bySlug;
-
-    if (postname.includes("/")) {
-      try {
-        const direct = await fetchImageFromUrl(
-          buildWordPressUploadsUrl(baseUrl, postname),
-        );
-        if (ALLOWED_IMAGE_TYPES.has(direct.mimeType)) {
-          return direct;
-        }
-      } catch {
-        // Fall through to search-based resolution.
-      }
-    }
+  if (postname && /^\d+$/.test(postname)) {
+    const byId = await fetchWordPressMediaById(baseUrl, postname);
+    if (byId) return byId;
   }
 
   const name = getStringFieldLoose(meta, [
@@ -366,29 +516,37 @@ async function resolveWordPressBracketImage(
     "file",
     "title",
   ]);
-  if (name) {
-    if (isProbablyUrl(name)) {
-      try {
-        return await fetchImageFromUrl(name);
-      } catch {
-        // Fall through.
-      }
-    }
 
-    if (name.includes("/")) {
+  for (const candidate of [name, postname]) {
+    if (!candidate) continue;
+
+    if (isProbablyUrl(candidate)) {
       try {
-        return await fetchImageFromUrl(buildWordPressUploadsUrl(baseUrl, name));
+        return await fetchImageFromUrl(candidate);
       } catch {
         // Fall through.
       }
     }
   }
 
-  const guessed = await fetchWordPressMediaByGuess(
-    baseUrl,
-    [postname, name].filter(Boolean) as string[],
-  );
+  const uploadReferences = buildWordPressImageGuesses(meta);
+  const direct = await tryDirectWordPressUploads(baseUrl, uploadReferences);
+  if (direct) return direct;
+
+  const guessed = await fetchWordPressMediaByGuess(baseUrl, uploadReferences);
   if (guessed) return guessed;
+
+  const recent = await fetchWordPressMediaFromRecent(
+    baseUrl,
+    uploadReferences,
+    mimeType,
+  );
+  if (recent) return recent;
+
+  if (mimeType && ALLOWED_IMAGE_TYPES.has(mimeType)) {
+    const latest = await fetchWordPressLatestMediaByMime(baseUrl, mimeType);
+    if (latest) return latest;
+  }
 
   return null;
 }
@@ -433,6 +591,28 @@ function collectBracketNamespace(
   return found ? result : null;
 }
 
+function collectWordPressImageMeta(
+  fields: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const bracketMeta = collectBracketNamespace(fields, "image");
+  if (bracketMeta) return bracketMeta;
+
+  const flatMeta = {
+    name: getField(fields, ["image_name", "imageName", "image-name"]),
+    mime: getField(fields, ["image_mime", "imageMime", "image-mime"]),
+    postname: getField(fields, [
+      "image_postname",
+      "imagePostname",
+      "image-postname",
+    ]),
+    id: getField(fields, ["image_id", "imageId", "image-id"]),
+    url: getField(fields, ["image_url", "imageUrl", "image-url"]),
+  };
+
+  const hasFlatValue = Object.values(flatMeta).some((value) => coerceFormString(value));
+  return hasFlatValue ? flatMeta : null;
+}
+
 async function resolveImageSource(
   fields: Record<string, unknown>,
   request: NextRequest,
@@ -463,8 +643,16 @@ async function resolveImageSource(
     "featured_image",
   ]);
 
-  const wpImageMeta = collectBracketNamespace(fields, "image");
+  const wpImageMeta = collectWordPressImageMeta(fields);
   const wordpressBaseUrl = getWordPressMediaBaseUrl(request);
+
+  if (wpImageMeta) {
+    console.info("[generate-card] WordPress image meta", {
+      meta: wpImageMeta,
+      wordpressBaseUrl,
+      guesses: buildWordPressImageGuesses(wpImageMeta),
+    });
+  }
 
   if (wpImageMeta && wordpressBaseUrl) {
     const resolved = await resolveWordPressBracketImage(
@@ -478,6 +666,12 @@ async function resolveImageSource(
 
       return resolved;
     }
+  }
+
+  if (wpImageMeta && !wordpressBaseUrl) {
+    console.warn(
+      "[generate-card] WordPress image fields present but site URL could not be determined from User-Agent or headers.",
+    );
   }
 
   const mimeTypeHint = getStringField(fields, [
@@ -608,9 +802,35 @@ async function resolveImageSource(
     }
   }
 
+  const wpImageMetaForError = collectWordPressImageMeta(fields);
+  const wordpressBaseUrlForError = getWordPressMediaBaseUrl(request);
+
+  console.warn("[generate-card] Unable to resolve image source", {
+    hasWordPressImageMeta: Boolean(wpImageMetaForError),
+    wordpressBaseUrl: wordpressBaseUrlForError,
+    imageMeta: wpImageMetaForError,
+    guesses: wpImageMetaForError
+      ? buildWordPressImageGuesses(wpImageMetaForError)
+      : [],
+  });
+
   throw new Error(
     "Field 'image' must be a file, a data URL, an image URL, or WordPress media metadata that can be resolved to a public URL.",
   );
+}
+
+async function readUrlEncodedFields(
+  request: NextRequest,
+): Promise<Record<string, unknown>> {
+  const body = await request.text();
+  const params = new URLSearchParams(body);
+  const fields: Record<string, unknown> = {};
+
+  for (const [key, value] of params.entries()) {
+    fields[key] = value;
+  }
+
+  return fields;
 }
 
 async function readRequestFields(
@@ -622,10 +842,11 @@ async function readRequestFields(
     return (await request.json()) as Record<string, unknown>;
   }
 
-  if (
-    contentType.includes("multipart/form-data") ||
-    contentType.includes("application/x-www-form-urlencoded")
-  ) {
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return readUrlEncodedFields(request);
+  }
+
+  if (contentType.includes("multipart/form-data")) {
     const formData = await request.formData();
     return Object.fromEntries(formData.entries());
   }
