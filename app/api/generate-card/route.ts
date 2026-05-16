@@ -54,6 +54,18 @@ function getField(fields: Record<string, unknown>, keys: string[]): unknown {
   return null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getObjectField(
+  fields: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> | null {
+  const value = getField(fields, keys);
+  return isRecord(value) ? value : null;
+}
+
 function isProbablyUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
 }
@@ -110,6 +122,23 @@ async function resolveImageSource(
     "image_url",
     "imageBase64",
     "image_base64",
+    "featuredImage",
+    "featured_image",
+    "attachmentUrl",
+    "attachment_url",
+    "photo",
+    "avatar",
+    "file",
+  ]);
+  const imageObject = getObjectField(fields, [
+    "image",
+    "imageData",
+    "image_data",
+    "media",
+    "imageMeta",
+    "image_meta",
+    "featuredImage",
+    "featured_image",
   ]);
   const mimeTypeHint = getStringField(fields, [
     "imageMimeType",
@@ -117,7 +146,53 @@ async function resolveImageSource(
     "mimeType",
     "image_type",
     "type",
+    "contentType",
+    "content_type",
+    "imageContentType",
+    "image_content_type",
   ]);
+
+  const tryResolveString = async (
+    value: string,
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> => {
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      return null;
+    }
+
+    if (trimmed.startsWith("data:")) {
+      const decoded = decodeDataUrl(trimmed);
+      if (!ALLOWED_IMAGE_TYPES.has(decoded.mimeType)) {
+        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+      }
+
+      return decoded;
+    }
+
+    if (isProbablyUrl(trimmed)) {
+      const fetched = await fetchImageFromUrl(trimmed);
+      if (!ALLOWED_IMAGE_TYPES.has(fetched.mimeType)) {
+        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+      }
+
+      return fetched;
+    }
+
+    if (mimeTypeHint && looksLikeBase64(trimmed)) {
+      const mimeType = mimeTypeHint;
+      if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
+        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+      }
+
+      return {
+        buffer: Buffer.from(trimmed, "base64"),
+        mimeType,
+      };
+    }
+
+    return null;
+  };
 
   if (image instanceof File && image.size > 0) {
     const mimeType = image.type || mimeTypeHint || "image/jpeg";
@@ -133,46 +208,56 @@ async function resolveImageSource(
   }
 
   if (typeof image === "string") {
-    const value = image.trim();
+    const resolved = await tryResolveString(image);
+    if (resolved) return resolved;
+  }
 
-    if (!value) {
-      throw new Error(
-        "Field 'image' must be a non-empty image file, data URL, or image URL.",
-      );
-    }
+  if (imageObject) {
+    const objectCandidates: Array<unknown> = [
+      imageObject.url,
+      imageObject.src,
+      imageObject.source_url,
+      imageObject.data,
+      imageObject.base64,
+      imageObject.content,
+      imageObject.image,
+      imageObject.file,
+    ];
 
-    if (value.startsWith("data:")) {
-      const decoded = decodeDataUrl(value);
-      if (!ALLOWED_IMAGE_TYPES.has(decoded.mimeType)) {
-        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+    const objectMimeType = getStringField(imageObject, [
+      "mimeType",
+      "mime_type",
+      "contentType",
+      "content_type",
+      "type",
+    ]);
+
+    for (const candidate of objectCandidates) {
+      if (candidate instanceof File && candidate.size > 0) {
+        const mimeType =
+          candidate.type || objectMimeType || mimeTypeHint || "image/jpeg";
+        if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
+          throw new Error(
+            "Unsupported image type. Use JPEG, PNG, WebP, or GIF.",
+          );
+        }
+
+        return {
+          buffer: Buffer.from(await candidate.arrayBuffer()),
+          mimeType,
+        };
       }
 
-      return decoded;
-    }
-
-    if (isProbablyUrl(value)) {
-      const fetched = await fetchImageFromUrl(value);
-      if (!ALLOWED_IMAGE_TYPES.has(fetched.mimeType)) {
-        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+      if (typeof candidate === "string") {
+        const resolved = await tryResolveString(candidate);
+        if (resolved) return resolved;
       }
-
-      return fetched;
-    }
-
-    if (mimeTypeHint && looksLikeBase64(value)) {
-      const mimeType = mimeTypeHint;
-      if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
-        throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
-      }
-
-      return {
-        buffer: Buffer.from(value, "base64"),
-        mimeType,
-      };
     }
   }
 
-  throw new Error("Field 'image' must be a file, a data URL, or an image URL.");
+  throw new Error(
+    "Field 'image' must be a file, a data URL, an image URL, or an object containing one of those values.",
+  );
 }
 
 async function readRequestFields(
@@ -210,6 +295,11 @@ export async function POST(request: NextRequest) {
     const fields = await readRequestFields(request);
     const name = getStringField(fields, ["name", "fullName"]);
     const email = getStringField(fields, ["email"]);
+
+    console.info("[generate-card] Incoming fields", {
+      keys: Object.keys(fields),
+      contentType: request.headers.get("content-type"),
+    });
 
     if (!name) {
       return jsonWithCors({ error: "Field 'name' is required." }, 400);
