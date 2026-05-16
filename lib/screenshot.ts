@@ -1,11 +1,8 @@
-import puppeteer from "puppeteer";
+import { launchBrowser } from "./browser";
 
 /** Renders the pass page, then crops to `.card` only (no body padding/background). */
 export async function captureCardPng(html: string): Promise<Buffer> {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
@@ -14,7 +11,7 @@ export async function captureCardPng(html: string): Promise<Buffer> {
       height: 900,
       deviceScaleFactor: 2,
     });
-    await page.setContent(html, { waitUntil: "load" });
+    await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
     await page.evaluate(() => document.fonts.ready);
 
     await page.addStyleTag({
