@@ -73,6 +73,12 @@ function buildEventPassHtml(name: string): string {
             <p style="font-size:12px; color:#9ca3af; margin:0; line-height:1.6; text-align:center;">
               © ${new Date().getFullYear()} Creator's Event
             </p>
+            <p style="font-size:12px; color:#9ca3af; margin:8px 0 0; line-height:1.6; text-align:center;">
+              <a href="https://www.instagram.com/unovative.media?igsh=anlmYWIyenZrbnow" style="color:#f97b3c; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; gap:8px;">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/a/a5/Instagram_icon.png?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=original" alt="Instagram" style="width:20px; height:20px; vertical-align:middle; border:0; display:inline-block;" />
+                <span style="color:#f97b3c; text-decoration:none;">Follow us on Instagram</span>
+              </a>
+            </p>
           </div>
         </div>
       </div>
