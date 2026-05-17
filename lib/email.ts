@@ -58,7 +58,7 @@ function buildEventPassHtml(name: string): string {
         <div style="background:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e2e5ee; box-shadow:0 4px 24px rgba(15,23,42,0.06);">
           <div style="background:linear-gradient(135deg,#f97b3c 0%,#f96b2f 55%,#e85d04 100%); padding:28px 32px;">
             <div style="font-size:11px; font-weight:600; letter-spacing:0.12em; color:#ffedd5; text-transform:uppercase; margin-bottom:8px;">Your pass</div>
-            <div style="font-size:22px; font-weight:700; color:#ffffff; line-height:1.35;">You're registered!</div>
+            <div style="font-size:22px; font-weight:700; color:#ffffff; line-height:1.35;">Entry Recieved!</div>
             <div style="font-size:14px; color:#ffedd5; margin-top:10px; line-height:1.5;">Your event pass is attached to this email. Show it at the venue.</div>
           </div>
           <div style="padding:28px 32px;">
