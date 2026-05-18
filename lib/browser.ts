@@ -1,6 +1,8 @@
 import chromium from "@sparticuz/chromium-min";
 import puppeteerCore, { type Browser } from "puppeteer-core";
 
+export type BrowserHandle = Browser;
+
 const isServerless =
   process.env.VERCEL === "1" || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
 
